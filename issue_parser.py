@@ -330,6 +330,56 @@ def display_pagination(current_page, total_pages):
                 st.button("⟫", key="last_page", use_container_width=False,
                          on_click=change_page, args=(total_pages,))
 
+def json_to_markdown(json_string):
+    """将 JSON 数据转换为 Markdown 格式"""
+    markdown = "# Issue 安全分析报告\n\n"
+    
+    # 分离有风险和无风险的 issues
+    risk_issues = []
+    no_risk_issues = []
+    
+    json_data = json.loads(json_string)
+    for item in json_data:
+        content = ""
+        # 添加标题
+        content += f"## Issue #{item['issue_number']} {item['issue_title']}\n\n"
+        
+        # 添加链接
+        content += f"- Issue 链接：[#{item['issue_number']}]({item['issue_url']})\n\n"
+        
+        # 添加内容
+        content += "### Issue 内容\n\n"
+        if item['issue_body']:
+            issue_content = item['issue_body'].replace('### ', '#### ')
+            content += f"{issue_content}\n\n"
+        else:
+            content += "无内容\n\n"
+        
+        # 添加分析结果
+        content += "### 分析结果\n\n"
+        content += f"{item['analysis']}\n\n"
+        
+        # 添加分隔线
+        content += "---\n\n"
+        
+        # 根据分析结果分类
+        if item['has_risk']:
+            risk_issues.append(content)
+        else:
+            no_risk_issues.append(content)
+    
+    # 添加有风险的 issues
+    if risk_issues:
+        markdown += f"# 🚨 存在安全风险的 Issues ({len(risk_issues)} 个)\n\n"
+        markdown += "".join(risk_issues)
+    
+    # 添加无风险的 issues
+    if no_risk_issues:
+        markdown += f"# 📌 不涉及安全风险的 Issues ({len(no_risk_issues)} 个)\n\n"
+        markdown += "".join(no_risk_issues)
+    
+    return markdown
+
 def display_action_buttons():
     """显示操作按钮（导出和清除）和分析进度"""
     st.markdown("""
@@ -418,6 +468,8 @@ def display_action_buttons():
         ensure_ascii=False,
         indent=4
     )
+
+    results_md = json_to_markdown(results_json)
     
     # 使用列布局
     cols = st.columns([2, 1, 1])
@@ -430,9 +482,9 @@ def display_action_buttons():
     with cols[1]:
         st.download_button(
             '导出结果',
-            data=results_json,
-            file_name='issue_analysis_results.json',
-            mime='application/json',
+            data=results_md,
+            file_name='issue_analysis_results.md',
+            mime='text/markdown',
             use_container_width=False
         )
     
@@ -536,7 +588,7 @@ def main():
         # 如果分析完成，重置状态
         if st.session_state.analysis_complete:
             st.session_state.analysis_complete = False
-            st.experimental_rerun()
+            st.rerun()
 
         # 显示分页控制
         st.write("---")  # 添加分隔线
