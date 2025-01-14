@@ -185,9 +185,10 @@ def display_issue(issue, analysis=None):
             with expander:
                 st.markdown(f"**Issue 链接：** [#{issue.number}]({issue.html_url})", unsafe_allow_html=True)
                 
-                # 处理Issue内容的换行
+                # 处理Issue内容的换行和未闭合的代码块
                 issue_content = issue.body if issue.body else '无内容'
                 if issue.body:
+                    issue_content = fix_code_blocks_in_details(issue_content)
                     issue_content = issue_content.replace('\n', '  \n')
                 st.markdown(f"**Issue 内容：**  \n{issue_content}")
                 
@@ -330,6 +331,52 @@ def display_pagination(current_page, total_pages):
                 st.button("⟫", key="last_page", use_container_width=False,
                          on_click=change_page, args=(total_pages,))
 
+def fix_code_blocks_in_details(text):
+    """修复 <details> 标签中未闭合的代码块"""
+    if not text or '<details>' not in text:
+        return text
+
+    # 分割文本为 details 内外的部分
+    parts = []
+    current_pos = 0
+    
+    while True:
+        # 查找下一个 details 开始标签
+        start = text.find('<details>', current_pos)
+        if start == -1:
+            # 没有更多的 details 标签，添加剩余部分
+            if current_pos < len(text):
+                parts.append(text[current_pos:])
+            break
+            
+        # 添加 details 之前的内容
+        if start > current_pos:
+            parts.append(text[current_pos:start])
+            
+        # 查找对应的结束标签
+        end = text.find('</details>', start)
+        if end == -1:
+            # 如果没有找到结束标签，处理到文本末尾
+            end = len(text)
+            
+        # 获取 details 中的内容
+        details_content = text[start:end]
+        
+        # 检查是否有未闭合的代码块
+        code_marks = details_content.count('```')
+        if code_marks % 2 == 1:
+            # 在 details 结束前添加闭合标记
+            details_content = details_content + '\n```\n'
+            
+        parts.append(details_content)
+        current_pos = end
+        
+        # 如果已经到达文本末尾，退出循环
+        if end == len(text):
+            break
+            
+    return ''.join(parts)
+
 def json_to_markdown(json_string):
     """将 JSON 数据转换为 Markdown 格式"""
     markdown = "# Issue 安全分析报告\n\n"
@@ -351,6 +398,8 @@ def json_to_markdown(json_string):
         content += "### Issue 内容\n\n"
         if item['issue_body']:
             issue_content = item['issue_body'].replace('### ', '#### ')
+            # 修复 details 中未闭合的代码块
+            issue_content = fix_code_blocks_in_details(issue_content)
             content += f"{issue_content}\n\n"
         else:
             content += "无内容\n\n"
