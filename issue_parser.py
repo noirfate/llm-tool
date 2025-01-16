@@ -107,11 +107,9 @@ def init_session_state():
     if 'model' not in st.session_state:
         st.session_state.model = 'o1-preview'
 
-# 添加缓存装饰器
-@lru_cache(maxsize=100)
 def analyze_issue(api_key, base_url, issue_title, issue_body, model):
     prompt = f"""
-    以下是一个软件开发项目的 Issue 标题和内容，请分析其中是否存在潜在的安全风险，如果不存在安全风险则仅回复不涉及，如果有则详细说明原因和可能的影响，给出proof of concept
+    以下是一个软件开发项目的 Issue 标题和内容，请分析其中是否存在潜在的安全风险，如果不存在安全风险则仅回复不涉及，如果存在风险但非高风险问题则仅回复低风险，如果有高风险问题则详细说明原因和可能的影响，给出proof of concept
 
     风险判断标准：
     1. 该风险能被攻击者利用
@@ -119,7 +117,10 @@ def analyze_issue(api_key, base_url, issue_title, issue_body, model):
     3. issue提交者在提交内容中暴露的敏感信息、不当操作、不当配置等问题，不属于安全风险，因为它是issue提交者的问题，而不是项目的问题
     4. 在风险为拒绝服务（DoS）攻击时，如果攻击者需要一定权限才能够实施该攻击，则视情况需要降级处理，当漏洞利用需要攻击者具备创建、修改等非只读权限时，则不应判断为高风险，CVSS评级在high以下
     5. 对于日志中泄露凭据的风险，如果攻击者可以利用比泄露凭据更低的权限从日志中读取该凭据，或者泄露的凭据与攻击者使用的凭据不是一类凭据，导致攻击者可以利用泄露凭据访问其他系统，则应适当提高风险评级判断为高风险
-    
+    6. 如果Issue不涉及安全问题，则仅回复不涉及
+    7. 如果Issue中存在安全风险，但风险评级在high以下，则仅回复低风险
+    8. 如果Issue可能导致命令执行、容器逃逸、提权等高安全风险的问题，则无论攻击者实施该攻击是否需要权限都应判断为高风险
+
     Issue 标题：
     {issue_title}
 
@@ -138,16 +139,17 @@ def analyze_issue(api_key, base_url, issue_title, issue_body, model):
         analysis = response.choices[0].message.content.strip()
         logger.info('分析完成')
         if '不涉及' in analysis:
-            has_risk = False
+            has_risk = 0
+        elif '低风险' in analysis:
+            has_risk = 1
         else:
-            has_risk = True
+            has_risk = 2
         return analysis, has_risk
     except Exception as e:
         logger.error(f"分析 Issue 时发生错误: {str(e)}")
         st.error(f"分析失败: {str(e)}")
-        return "分析失败，请稍后重试", False
+        return "分析失败，请稍后重试", -1
 
-@st.cache_data(ttl=3600)  # 缓存一小时
 def get_issues(repo_name, labels, since_time, until_time, github_token):
     try:
         g = Github(github_token)
@@ -175,8 +177,10 @@ def display_issue(issue, analysis=None):
     
     with cols[0]:
         if analysis:
-            if analysis.get('has_risk'):
+            if analysis.get('has_risk') == 2:
                 title_color = "red"
+            elif analysis.get('has_risk') == 1:
+                title_color = "orange"
             else:
                 title_color = "green"
         else:
@@ -219,6 +223,9 @@ def analyze_single_issue(issue, api_key, base_url):
             issue.body or '',
             st.session_state.model
         )
+        if has_risk == -1:
+            st.error(f"分析Issue #{issue.number}失败: {analysis_result}")
+            return
         result = {
             'issue_number': issue.number,
             'issue_title': issue.title,
@@ -384,8 +391,9 @@ def json_to_markdown(json_string):
     """将 JSON 数据转换为 Markdown 格式"""
     markdown = "# Issue 安全分析报告\n\n"
     
-    # 分离有风险和无风险的 issues
+    # 分离不同风险等级的 issues
     risk_issues = []
+    low_risk_issues = []
     no_risk_issues = []
     
     json_data = json.loads(json_string)
@@ -415,8 +423,10 @@ def json_to_markdown(json_string):
         content += "---\n\n"
         
         # 根据分析结果分类
-        if item['has_risk']:
+        if item['has_risk'] == 2:
             risk_issues.append(content)
+        elif item['has_risk'] == 1:
+            low_risk_issues.append(content)
         else:
             no_risk_issues.append(content)
     
@@ -424,6 +434,11 @@ def json_to_markdown(json_string):
     if risk_issues:
         markdown += f"# 🚨 存在安全风险的 Issues ({len(risk_issues)} 个)\n\n"
         markdown += "".join(risk_issues)
+    
+    # 添加低风险的 issues
+    if low_risk_issues:
+        markdown += f"# 🚨 存在低风险的 Issues ({len(low_risk_issues)} 个)\n\n"
+        markdown += "".join(low_risk_issues)
     
     # 添加无风险的 issues
     if no_risk_issues:
