@@ -109,7 +109,7 @@ def init_session_state():
 
 def analyze_issue(api_key, base_url, issue_title, issue_body, model):
     prompt = f"""
-    以下是一个软件开发项目的 Issue 标题和内容，请分析其中是否存在潜在的安全风险，如果不存在安全风险则仅回复不涉及，如果存在风险但非高风险问题则仅回复低风险，如果有高风险问题则详细说明原因和可能的影响，给出proof of concept
+    以下是一个软件开发项目的 Issue 标题和内容，请分析其中是否存在潜在的安全风险并给出判断依据，如果有高风险问题则详细说明原因和可能的影响，给出proof of concept
 
     风险判断标准：
     1. 该风险能被攻击者利用
@@ -117,9 +117,12 @@ def analyze_issue(api_key, base_url, issue_title, issue_body, model):
     3. issue提交者在提交内容中暴露的敏感信息、不当操作、不当配置等问题，不属于安全风险，因为它是issue提交者的问题，而不是项目的问题
     4. 在风险为拒绝服务（DoS）攻击时，如果攻击者需要一定权限才能够实施该攻击，则视情况需要降级处理，当漏洞利用需要攻击者具备创建、修改等非只读权限时，则不应判断为高风险，CVSS评级在high以下
     5. 对于日志中泄露凭据的风险，如果攻击者可以利用比泄露凭据更低的权限从日志中读取该凭据，或者泄露的凭据与攻击者使用的凭据不是一类凭据，导致攻击者可以利用泄露凭据访问其他系统，则应适当提高风险评级判断为高风险
-    6. 如果Issue不涉及安全问题，则仅回复不涉及
-    7. 如果Issue中存在安全风险，但风险评级在high以下，则仅回复低风险
+    6. 如果Issue不涉及安全问题，则风险评级判断为不涉及
+    7. 如果Issue中存在安全风险，但风险评级在high以下，则风险评级判断为低风险
     8. 如果Issue可能导致命令执行、容器逃逸、提权等高安全风险的问题，则无论攻击者实施该攻击是否需要权限都应判断为高风险
+    9. 如果Issue可以发生在多用户场景中，一个低权限用户能够影响和自己权限一样甚至更高的其他用户，如在自身容器中执行命令而影响到他人容器，则应判断为高风险
+    10. 如果issue中提供的内容不够充分，则根据issue可能导致的后果判断风险评级
+    11. 针对高风险问题，必须按照格式要求给出proof of concept
 
     Issue 标题：
     {issue_title}
@@ -127,7 +130,28 @@ def analyze_issue(api_key, base_url, issue_title, issue_body, model):
     Issue 内容：
     {issue_body}
 
-    请注意，只需要关注与安全相关的内容，回答请用中文。
+    请注意，只需要关注与安全相关的内容，回答请用中文，并使用json格式进行回答，格式如下：
+
+    ```json
+    {{
+      "analysis": "分析内容",
+      "has_risk": "风险评级，分为三类，不涉及，低风险和高风险",
+      "poc": [
+        {{
+          "cmd": "执行的命令",
+          "explain": "对命令的说明"
+        }},
+        {{
+          "cmd": "执行的命令",
+          "explain": "对命令的说明"
+        }}
+      ]
+    }}
+    ```
+
+    json分为两大块，第一块"analysis"存放对风险分析的内容，使用markdown格式，不需要设置标题，第二块"poc"存放对该风险的proof of concept，要按照复现过程把它拆解为一条条实际可执行的命令，cmd中只存放能够在系统中直接执行的命令，不能包含文字描述，如果需要文件则用cat命令生成文件，不能直接放文件内容，在explain中存放对cmd的解释说明
+
+    最后再仔细检查一下返回的json内容，确保没有语法错误，该转义的地方都做了转义！
     """
     try:
         logger.info('开始分析')
@@ -136,19 +160,62 @@ def analyze_issue(api_key, base_url, issue_title, issue_body, model):
             model=model,
             messages=[{'role': 'user', 'content': prompt}]
         )
-        analysis = response.choices[0].message.content.strip()
-        logger.info('分析完成')
-        if '不涉及' in analysis:
-            has_risk = 0
-        elif '低风险' in analysis:
+        
+        # 解析返回的 JSON
+        content = response.choices[0].message.content.strip()
+
+        json_start = content.find('{')
+        json_end = content.rfind('}') + 1
+        if json_start == -1 or json_end == 0:
+            raise ValueError("返回的内容不包含有效的 JSON")
+        json_str = content[json_start:json_end]
+        
+        try:
+            # 首次尝试解析
+            result = json.loads(json_str)
+        except json.JSONDecodeError as err:
+            # 如果解析失败，尝试只转义 analysis 字段的内容
+            logger.error(f"JSON 解析错误: {str(err)}")
+            logger.info('首次解析失败，尝试转义 analysis 字段')
+            try:
+                # 使用正则表达式提取 analysis 字段内容
+                import re
+                pattern = r'"analysis"\s*:\s*"([^"]*)"'
+                match = re.search(pattern, json_str)
+                if match:
+                    # 获取匹配的内容
+                    analysis_content = match.group(1)
+                    # 转义 analysis 内容
+                    escaped_analysis = analysis_content.replace('\\', '\\\\').replace('"', '\\"')
+                    # 替换原始内容
+                    new_json_str = json_str[:match.start(1)] + escaped_analysis + json_str[match.end(1):]
+                    result = json.loads(new_json_str)
+                else:
+                    raise ValueError("无法定位 analysis 字段")
+            except (json.JSONDecodeError, ValueError) as e:
+                # 如果仍然失败，记录原始内容并抛出异常
+                logger.error(f"JSON 解析失败，原始内容: {json_str}")
+                raise json.JSONDecodeError(str(e), json_str, 0)
+        
+        # 解析风险等级
+        risk_level = result.get('has_risk', '不涉及').strip()
+        if '高风险' in risk_level:
+            has_risk = 2
+        elif '低风险' in risk_level:
             has_risk = 1
         else:
-            has_risk = 2
-        return analysis, has_risk
+            has_risk = 0
+            
+        logger.info('分析完成')
+        return result, has_risk
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON 解析错误: {str(e)}")
+        st.error(f"返回格式错误: {str(e)}\n\n返回内容: {json_str}\n\n")
+        return {"error": "分析失败，返回格式错误"}, -1
     except Exception as e:
         logger.error(f"分析 Issue 时发生错误: {str(e)}")
-        st.error(f"分析失败: {str(e)}")
-        return "分析失败，请稍后重试", -1
+        st.error(f"分析 Issue 时发生错误: {str(e)}")
+        return {"error": "分析失败，请稍后重试"}, -1
 
 def get_issues(repo_name, labels, since_time, until_time, github_token):
     try:
@@ -201,17 +268,23 @@ def display_issue(issue, analysis=None):
                 
                 # 处理分析结果的换行
                 if analysis:
-                    analysis_content = analysis['analysis'].replace('\n', '  \n')
-                    st.markdown(f"**分析结果：**  \n{analysis_content}")
+                    analysis_data = analysis['analysis']  # 获取分析结果
+                    st.markdown("**分析结果**  \n")
+                    st.markdown(f"**风险定级：**  \n{analysis_data['has_risk']}\n")
+                    st.markdown(f"**判断依据：**  \n{analysis_data['analysis']}\n")
+                    if analysis_data.get('poc'):  # 只有当 poc 不为空时才显示
+                        formatted_poc = json.dumps(analysis_data['poc'], ensure_ascii=False, indent=2)
+                        st.markdown("**复现过程：**")
+                        st.code(formatted_poc, language="json")
     
     with cols[1]:
-        # 只显示分析按钮
-        if not analysis:
-            with st.container():
-                st.markdown('<div class="analyze-button">', unsafe_allow_html=True)
-                st.button("分析", key=f"analyze_{issue.number}", type="secondary", use_container_width=True,
-                         on_click=analyze_single_issue, args=(issue, openai_api_key, openai_base_url))
-                st.markdown('</div>', unsafe_allow_html=True)
+        # 始终显示分析按钮，根据是否已分析显示不同文本
+        with st.container():
+            st.markdown('<div class="analyze-button">', unsafe_allow_html=True)
+            button_text = "重新分析" if analysis else "分析"
+            st.button(button_text, key=f"analyze_{issue.number}", type="secondary", use_container_width=True,
+                     on_click=analyze_single_issue, args=(issue, openai_api_key, openai_base_url))
+            st.markdown('</div>', unsafe_allow_html=True)
 
 def analyze_single_issue(issue, api_key, base_url):
     """分析单个issue的辅助函数"""
@@ -226,6 +299,7 @@ def analyze_single_issue(issue, api_key, base_url):
         if has_risk == -1:
             st.error(f"分析Issue #{issue.number}失败: {analysis_result}")
             return
+            
         result = {
             'issue_number': issue.number,
             'issue_title': issue.title,
@@ -234,9 +308,24 @@ def analyze_single_issue(issue, api_key, base_url):
             'has_risk': has_risk,
             'issue_body': issue.body or ''
         }
+        
         if 'analysis_results' not in st.session_state:
             st.session_state.analysis_results = []
-        st.session_state.analysis_results.append(result)
+            
+        # 查找是否已存在该 issue 的分析结果
+        existing_index = next(
+            (i for i, r in enumerate(st.session_state.analysis_results) 
+             if r['issue_number'] == issue.number), 
+            -1
+        )
+        
+        if existing_index != -1:
+            # 如果已存在，替换原有结果
+            st.session_state.analysis_results[existing_index] = result
+        else:
+            # 如果不存在，添加新结果
+            st.session_state.analysis_results.append(result)
+            
         st.session_state.analysis_complete = True
     except Exception as e:
         st.error(f"分析Issue #{issue.number}失败: {str(e)}")
@@ -417,7 +506,19 @@ def json_to_markdown(json_string):
         
         # 添加分析结果
         content += "### 分析结果\n\n"
-        content += f"{item['analysis']}\n\n"
+        analysis_data = item['analysis']
+        
+        # 添加风险定级
+        content += f"**风险定级：**  \n{analysis_data['has_risk']}\n\n"
+        
+        # 添加判断依据
+        content += f"**判断依据：**  \n{analysis_data['analysis']}\n\n"
+        
+        # 添加复现过程（如果有）
+        if analysis_data.get('poc'):
+            content += "**复现过程：**\n\n```json\n"
+            content += json.dumps(analysis_data['poc'], ensure_ascii=False, indent=2)
+            content += "\n```\n\n"
         
         # 添加分隔线
         content += "---\n\n"
@@ -430,19 +531,19 @@ def json_to_markdown(json_string):
         else:
             no_risk_issues.append(content)
     
-    # 添加有风险的 issues
+    # 添加高风险的 issues
     if risk_issues:
-        markdown += f"# 🚨 存在安全风险的 Issues ({len(risk_issues)} 个)\n\n"
+        markdown += f"# 🚨 存在高风险的 Issues ({len(risk_issues)} 个)\n\n"
         markdown += "".join(risk_issues)
     
     # 添加低风险的 issues
     if low_risk_issues:
-        markdown += f"# 🚨 存在低风险的 Issues ({len(low_risk_issues)} 个)\n\n"
+        markdown += f"# ⚠️ 存在低风险的 Issues ({len(low_risk_issues)} 个)\n\n"
         markdown += "".join(low_risk_issues)
     
     # 添加无风险的 issues
     if no_risk_issues:
-        markdown += f"# 📌 不涉及安全风险的 Issues ({len(no_risk_issues)} 个)\n\n"
+        markdown += f"# ✅ 不涉及安全风险的 Issues ({len(no_risk_issues)} 个)\n\n"
         markdown += "".join(no_risk_issues)
     
     return markdown
