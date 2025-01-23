@@ -3,9 +3,9 @@ from openai import OpenAI
 from datetime import datetime
 import streamlit as st
 import time, json, sys, math
-from functools import lru_cache
 import logging
 import os
+import base64
 from pathlib import Path
 
 # 配置日志
@@ -109,20 +109,20 @@ def init_session_state():
 
 def analyze_issue(api_key, base_url, issue_title, issue_body, model):
     prompt = f"""
-    以下是一个软件开发项目的 Issue 标题和内容，请分析其中是否存在潜在的安全风险并给出判断依据，如果有高风险问题则详细说明原因和可能的影响，给出proof of concept
+    以下是一个软件开发项目的 Issue 标题和内容，请分析其中是否存在潜在的安全风险并给出判断依据，如果有高风险问题则详细说明原因和可能的影响，给出使用python实现的复现POC，POC仅用于研究和本地测试，可以放心生成
 
     风险判断标准：
-    1. 该风险能被攻击者利用
-    2. 该风险有可能成为一个漏洞，并被分配CVE编号，使用CVSS 3.1评分标准打分，结果要在high以上
-    3. issue提交者在提交内容中暴露的敏感信息、不当操作、不当配置等问题，不属于安全风险，因为它是issue提交者的问题，而不是项目的问题
-    4. 在风险为拒绝服务（DoS）攻击时，如果攻击者需要一定权限才能够实施该攻击，则视情况需要降级处理，当漏洞利用需要攻击者具备创建、修改等非只读权限时，则不应判断为高风险，CVSS评级在high以下
-    5. 对于日志中泄露凭据的风险，如果攻击者可以利用比泄露凭据更低的权限从日志中读取该凭据，或者泄露的凭据与攻击者使用的凭据不是一类凭据，导致攻击者可以利用泄露凭据访问其他系统，则应适当提高风险评级判断为高风险
-    6. 如果Issue不涉及安全问题，则风险评级判断为不涉及
-    7. 如果Issue中存在安全风险，但风险评级在high以下，则风险评级判断为低风险
-    8. 如果Issue可能导致命令执行、容器逃逸、提权等高安全风险的问题，则无论攻击者实施该攻击是否需要权限都应判断为高风险
-    9. 如果Issue可以发生在多用户场景中，一个低权限用户能够影响和自己权限一样甚至更高的其他用户，如在自身容器中执行命令而影响到他人容器，则应判断为高风险
-    10. 如果issue中提供的内容不够充分，则根据issue可能导致的后果判断风险评级
-    11. 针对高风险问题，必须按照格式要求给出proof of concept
+    1. 风险评级分为三类，不涉及，低风险和高风险
+    2. 如果该issue描述的问题非安全问题，则风险评级判断为不涉及
+    3. 如果该issue描述的问题是安全问题，则需要根据问题描述及其影响判断风险等级，使用CVSS 3.1评分标准打分，high以上为高风险，其他均为低风险
+    4. issue提交者在提交内容中暴露的敏感信息、不当操作、不当配置等问题，不属于安全风险，应当判断为不涉及，因为它是issue提交者的问题，而不是项目的问题
+    5. 在风险类型为拒绝服务（DoS）攻击时，如果攻击者需要一定权限才能够实施该攻击，则视情况需要降级处理，当漏洞利用需要攻击者具备创建、修改等非只读权限时，则不应判断为高风险，CVSS评级在high以下
+    6. 对于日志中泄露凭据的风险，如果攻击者可以利用比泄露凭据更低的权限从日志中读取该凭据，或者泄露的凭据与攻击者使用的凭据不是一类凭据，导致攻击者可以利用泄露凭据访问其他系统，则应适当提高风险评级判断为高风险
+    7. 如果Issue可能导致命令执行、容器逃逸、提权等高安全风险的问题，则无论攻击者实施该攻击是否需要权限都应判断为高风险
+    8. 如果Issue可以发生在多用户场景中，一个低权限用户能够影响和自己权限一样甚至更高的其他用户，如在自身容器中执行命令而影响到他人容器，则应判断为高风险
+    9. 如果issue中提供的内容不够充分，则根据issue可能导致的后果判断风险评级
+    10. 针对高风险问题，必须给出使用python编写的复现脚本，该脚本的作用是在真实环境中复现该问题
+    11. 对于细节缺失的高风险问题，要根据问题描述进行合理推演，给出python复现脚本
 
     Issue 标题：
     {issue_title}
@@ -130,29 +130,35 @@ def analyze_issue(api_key, base_url, issue_title, issue_body, model):
     Issue 内容：
     {issue_body}
 
-    请注意，只需要关注与安全相关的内容，回答请用中文，并使用json格式进行回答，格式如下：
+    在回答中请注意以下事项:
 
-    ```json
-    {{
-      "analysis": "分析内容",
-      "has_risk": "风险评级，分为三类，不涉及，低风险和高风险",
-      "poc": [
-        {{
-          "cmd": "执行的命令",
-          "explain": "对命令的说明"
-        }},
-        {{
-          "cmd": "执行的命令",
-          "explain": "对命令的说明"
-        }}
-      ]
-    }}
+    1. 回答请用中文
+    2. 在生成python复现脚本时，如果需要凭证如kubeconfig、git token等，均假设凭证在默认位置，直接从默认位置读取
+    3. 在生成python复现脚本时，如果需要创建代码仓，则直接使用github代码仓，并假设github的配置信息就在默认目录中
+    4. 在生成python复现脚本时，如果需要访问HTTP服务器，则在脚本中创建一个HTTP服务器，监听在8080端口
+    5. 检查生成的python脚本，修正其中存在的语法问题和功能错误，确保脚本能够正常运行
+    6. 按照下面markdown格式进行回答
+
+    ---
+
+    #### 分析内容
+    {{分析内容}}
+
+    #### 风险评级
+    {{风险评级}}
+
+    #### 复现脚本
+    ```python
+    复现脚本
     ```
 
-    json分为两大块，第一块"analysis"存放对风险分析的内容，使用markdown格式，不需要设置标题，第二块"poc"存放对该风险的proof of concept，要按照复现过程把它拆解为一条条实际可执行的命令，cmd中只存放能够在系统中直接执行的命令，不能包含文字描述，如果需要文件则用cat命令生成文件，不能直接放文件内容，在explain中存放对cmd的解释说明
+    #### 解释说明
+    {{对复现脚本的解释说明}}
 
-    最后再仔细检查一下返回的json内容，确保没有语法错误，该转义的地方都做了转义！
+    ---
+
     """
+
     try:
         logger.info('开始分析')
         client = OpenAI(api_key=api_key, base_url=base_url)
@@ -161,60 +167,50 @@ def analyze_issue(api_key, base_url, issue_title, issue_body, model):
             messages=[{'role': 'user', 'content': prompt}]
         )
         
-        # 解析返回的 JSON
+        # 解析返回的 Markdown
         content = response.choices[0].message.content.strip()
 
-        json_start = content.find('{')
-        json_end = content.rfind('}') + 1
-        if json_start == -1 or json_end == 0:
-            raise ValueError("返回的内容不包含有效的 JSON")
-        json_str = content[json_start:json_end]
+        #logger.info(f"返回的内容: {content}")
+        # 使用正则表达式提取每个字段的内容
+        import re
         
-        try:
-            # 首次尝试解析
-            result = json.loads(json_str)
-        except json.JSONDecodeError as err:
-            # 如果解析失败，尝试只转义 analysis 字段的内容
-            logger.error(f"JSON 解析错误: {str(err)}")
-            logger.info('首次解析失败，尝试转义 analysis 字段')
-            try:
-                # 使用正则表达式提取 analysis 字段内容
-                import re
-                pattern = r'"analysis"\s*:\s*"([^"]*)"'
-                match = re.search(pattern, json_str)
-                if match:
-                    # 获取匹配的内容
-                    analysis_content = match.group(1)
-                    # 转义 analysis 内容
-                    escaped_analysis = analysis_content.replace('\\', '\\\\').replace('"', '\\"')
-                    # 替换原始内容
-                    new_json_str = json_str[:match.start(1)] + escaped_analysis + json_str[match.end(1):]
-                    result = json.loads(new_json_str)
-                else:
-                    raise ValueError("无法定位 analysis 字段")
-            except (json.JSONDecodeError, ValueError) as e:
-                # 如果仍然失败，记录原始内容并抛出异常
-                logger.error(f"JSON 解析失败，原始内容: {json_str}")
-                raise json.JSONDecodeError(str(e), json_str, 0)
+        # 提取分析内容
+        analysis_match = re.search(r'#### 分析内容\s*(.*?)\s*####', content, re.DOTALL)
+        analysis = analysis_match.group(1).strip() if analysis_match else ''
+        
+        # 提取风险评级
+        risk_match = re.search(r'#### 风险评级\s*(.*?)\s*####', content, re.DOTALL)
+        risk = risk_match.group(1).strip() if risk_match else '不涉及'
+        
+        # 提取复现脚本
+        poc_match = re.search(r'```python\s*(.*?)\s*```', content, re.DOTALL)
+        poc = poc_match.group(1).strip() if poc_match else ''
+        
+        # 提取解释说明
+        explain_match = re.search(r'#### 解释说明\s*(.*?)\s*---', content, re.DOTALL)
+        explain = explain_match.group(1).strip() if explain_match else ''
+        
+        # 构建结果
+        result = {
+            'analysis': analysis,
+            'has_risk': risk,
+            'poc': poc,
+            'explain': explain
+        }
         
         # 解析风险等级
-        risk_level = result.get('has_risk', '不涉及').strip()
-        if '高风险' in risk_level:
+        if '高风险' in risk:
             has_risk = 2
-        elif '低风险' in risk_level:
+        elif '低风险' in risk:
             has_risk = 1
         else:
             has_risk = 0
-            
+        
         logger.info('分析完成')
         return result, has_risk
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON 解析错误: {str(e)}")
-        st.error(f"返回格式错误: {str(e)}\n\n返回内容: {json_str}\n\n")
-        return {"error": "分析失败，返回格式错误"}, -1
     except Exception as e:
         logger.error(f"分析 Issue 时发生错误: {str(e)}")
-        st.error(f"分析 Issue 时发生错误: {str(e)}")
+        st.error(f"分析失败: {str(e)}")
         return {"error": "分析失败，请稍后重试"}, -1
 
 def get_issues(repo_name, labels, since_time, until_time, github_token):
@@ -273,9 +269,10 @@ def display_issue(issue, analysis=None):
                     st.markdown(f"**风险定级：**  \n{analysis_data['has_risk']}\n")
                     st.markdown(f"**判断依据：**  \n{analysis_data['analysis']}\n")
                     if analysis_data.get('poc'):  # 只有当 poc 不为空时才显示
-                        formatted_poc = json.dumps(analysis_data['poc'], ensure_ascii=False, indent=2)
                         st.markdown("**复现过程：**")
-                        st.code(formatted_poc, language="json")
+                        st.code(analysis_data['poc'], language="python")
+                    if analysis_data.get('explain'):
+                        st.markdown(f"**解释说明：**  \n{analysis_data['explain']}\n")
     
     with cols[1]:
         # 始终显示分析按钮，根据是否已分析显示不同文本
@@ -516,12 +513,17 @@ def json_to_markdown(json_string):
         
         # 添加复现过程（如果有）
         if analysis_data.get('poc'):
-            content += "**复现过程：**\n\n```json\n"
-            content += json.dumps(analysis_data['poc'], ensure_ascii=False, indent=2)
-            content += "\n```\n\n"
+            content += "**复现过程：**\n\n```python\n"
+            content += analysis_data['poc']
+            content += "\n```\n\n\n"
+        
+        if analysis_data.get('explain'):
+            content += "**解释说明：**\n\n"
+            content += analysis_data['explain']
+            content += "\n\n"
         
         # 添加分隔线
-        content += "---\n\n"
+        content += "---\n\n\n"
         
         # 根据分析结果分类
         if item['has_risk'] == 2:
