@@ -2,10 +2,8 @@ from github import Github
 from openai import OpenAI
 from datetime import datetime
 import streamlit as st
-import time, json, sys, math
+import json, sys, math
 import logging
-import os
-import base64
 from pathlib import Path
 
 # 配置日志
@@ -63,8 +61,9 @@ with st.sidebar:
     
     # 添加模型选择下拉框
     model_options = {
-        'o1-preview': 'o1-preview',
-        'gpt-4o': 'gpt-4o'
+        'o1-mini': 'o1-mini',
+        'o3-mini': 'o3-mini',
+        'deepseek-r1': 'deepseek-r1'
     }
     selected_model = st.selectbox(
         "选择模型",
@@ -76,15 +75,25 @@ with st.sidebar:
     
     # 添加保存配置按钮
     if st.button("保存配置"):
-        config = {
-            'repo_name': repo_name,
-            'labels': labels,
-            'openai_api_key': openai_api_key,
-            'openai_base_url': openai_base_url,
-            'github_token': github_token,
-            'model': selected_model
-        }
-        if save_config(config):
+        # 先读取现有配置
+        current_config = load_config()
+
+        # 更新配置项（只更新非空值）
+        if repo_name:
+            current_config['repo_name'] = repo_name
+        if labels:
+            current_config['labels'] = labels
+        if openai_api_key:
+            current_config['openai_api_key'] = openai_api_key
+        if openai_base_url:
+            current_config['openai_base_url'] = openai_base_url
+        if github_token:
+            current_config['github_token'] = github_token
+        if selected_model:
+            current_config['model'] = selected_model
+            
+        # 保存更新后的配置
+        if save_config(current_config):
             st.success("配置已保存")
         else:
             st.error("配置保存失败")
