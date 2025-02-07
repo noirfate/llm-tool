@@ -129,18 +129,34 @@ def generate_search_query(user_input):
 
 async def extract_webpage_content(url):
     """使用pyppeteer提取网页主要内容"""
-    browser = await launch({
-        'headless': True
-    })
-    page = await browser.newPage()
-    await page.goto(url, {'waitUntil': 'networkidle2'})
-    content = await page.evaluate('''() => {
-        return document.body.innerText;
-    }''')
-    await browser.close()
-    content = '\n'.join(line.strip() for line in content.splitlines() if line.strip())
-    content = ' '.join(content.split())
-    return content
+    for attempt in range(2):  # 最多尝试2次
+        browser = await launch({
+            'headless': True,
+            'args': ['--no-sandbox', '--disable-setuid-sandbox']
+        })
+        page = await browser.newPage()
+        try:
+            # 设置更长的超时时间（90秒）
+            await page.goto(url, {
+                'waitUntil': 'networkidle2',
+                'timeout': 90000  # 90秒
+            })
+            content = await page.evaluate('''() => {
+                return document.body.innerText;
+            }''')
+            await browser.close()
+            content = '\n'.join(line.strip() for line in content.splitlines() if line.strip())
+            content = ' '.join(content.split())
+            return content
+        except Exception as e:
+            await browser.close()
+            if attempt == 0:  # 第一次失败
+                logger.warning(f"提取网页内容失败，正在重试: {str(e)}")
+                await asyncio.sleep(2)  # 等待2秒后重试
+                continue
+            else:  # 第二次失败
+                logger.error(f"提取网页内容两次尝试都失败: {str(e)}")
+                return None
 
 def generate_content_summary(content, query, client):
     """使用大模型生成内容摘要"""
@@ -173,6 +189,36 @@ def generate_content_summary(content, query, client):
         st.error(f"生成摘要失败: {str(e)}")
         return None
 
+async def process_single_result(result, query, client, idx, total_results, progress_placeholder):
+    """异步处理单个搜索结果"""
+    try:
+        # 显示当前进度
+        progress_placeholder.info(f"正在处理搜索结果 {idx}: {result['title']}")
+        
+        # 提取网页内容
+        content = await extract_webpage_content(result["href"])
+        
+        # 生成摘要
+        if content:
+            progress_placeholder.info(f"正在为搜索结果 {idx} 生成摘要...")
+            summary = generate_content_summary(content, query, client)
+        else:
+            summary = result["body"]  # 如果无法提取内容，使用原始摘要
+            
+        return {
+            "title": result["title"],
+            "snippet": summary or result["body"],  # 如果摘要生成失败，使用原始摘要
+            "url": result["href"]
+        }
+    except Exception as e:
+        st.error(f"处理结果失败 ({result['href']}): {str(e)}")
+        # 如果处理失败，使用原始结果
+        return {
+            "title": result["title"],
+            "snippet": result["body"],
+            "url": result["href"]
+        }
+
 def web_search(query):
     """使用DuckDuckGo执行搜索并生成相关摘要"""
     try:
@@ -185,40 +231,28 @@ def web_search(query):
         
         # 创建OpenAI客户端
         client = OpenAI(api_key=api_key, base_url=api_base)
-        
+
         # 创建进度显示
         progress_placeholder = st.empty()
         total_results = len(results)
         
-        processed_results = []
-        for idx, result in enumerate(results, 1):
-            try:
-                # 显示当前进度
-                progress_placeholder.info(f"正在处理搜索结果 {idx}/{total_results}: {result['title']}")
-                
-                # 使用全局事件循环执行异步函数
-                content = loop.run_until_complete(extract_webpage_content(result["href"]))
-                
-                # 生成摘要
-                if content:
-                    progress_placeholder.info(f"正在为搜索结果 {idx}/{total_results} 生成摘要...")
-                    summary = generate_content_summary(content, query, client)
-                else:
-                    summary = result["body"]  # 如果无法提取内容，使用原始摘要
-                    
-                processed_results.append({
-                    "title": result["title"],
-                    "snippet": summary or result["body"],  # 如果摘要生成失败，使用原始摘要
-                    "url": result["href"]
-                })
-            except Exception as e:
-                st.error(f"处理结果失败 ({result['href']}): {str(e)}")
-                # 如果处理失败，使用原始结果
-                processed_results.append({
-                    "title": result["title"],
-                    "snippet": result["body"],
-                    "url": result["href"]
-                })
+        # 创建信号量限制并发数
+        semaphore = asyncio.Semaphore(3)
+        
+        async def process_with_semaphore(result, idx):
+            async with semaphore:
+                return await process_single_result(
+                    result, query, client, idx + 1, total_results, progress_placeholder
+                )
+        
+        # 创建所有任务
+        tasks = [
+            process_with_semaphore(result, idx)
+            for idx, result in enumerate(results)
+        ]
+        
+        # 并行执行所有任务
+        processed_results = loop.run_until_complete(asyncio.gather(*tasks))
         
         # 清除进度显示
         progress_placeholder.empty()
