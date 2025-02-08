@@ -5,10 +5,10 @@ from pathlib import Path
 import asyncio
 import os
 import nest_asyncio
-import signal
-import platform
 import logging
 import json
+import atexit
+import psutil
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -17,16 +17,15 @@ logger = logging.getLogger(__name__)
 # 应用nest_asyncio
 nest_asyncio.apply()
 
+# 设置pyppeteer环境变量
 os.environ['PYPPETEER_CHROMIUM_REVISION'] = '1380989'
 os.environ["PYPPETEER_DOWNLOAD_HOST"] = "http://npm.taobao.org/mirrors/chromium-browser-snapshots/"
+os.environ['PYPPETEER_NO_SIGNAL'] = '1'  # 禁用pyppeteer的信号处理
+
 from pyppeteer import launch
 
 # 初始化全局事件循环
 loop = asyncio.get_event_loop()
-
-# 禁用信号处理（仅在Windows上）
-if platform.system() == 'Windows':
-    signal.signal = lambda *args: None
 
 # 添加配置管理相关函数
 def get_config_path():
@@ -68,7 +67,7 @@ with st.sidebar:
     saved_config = load_config()
     api_key = st.text_input("OpenAI API密钥", value=saved_config.get('openai_api_key', ''), type="password")
     api_base = st.text_input("OpenAI Base URL", value=saved_config.get('openai_base_url', "https://api.wlai.vip/v1"))
-    search_count = st.text_input("搜索结果数量", value="15")
+    search_count = st.text_input("搜索结果数量", value=saved_config.get('search_count', "15"))
 
 # 添加模型选择下拉框
     model_options = {
@@ -127,15 +126,33 @@ def generate_search_query(user_input):
     result = response.choices[0].message.content.strip()
     return process_deepseek_response(result, st.session_state.model)
 
+def cleanup_chrome_processes():
+    """清理所有残留的Chrome进程"""
+    try:
+        for proc in psutil.process_iter(['name']):
+            if proc.info['name'] and ('chromium' in proc.info['name'].lower()):
+                try:
+                    proc.terminate()
+                except:
+                    pass
+    except Exception as e:
+        logger.error(f"清理Chrome进程失败: {str(e)}")
+
+# 注册退出时的清理函数
+atexit.register(cleanup_chrome_processes)
+
 async def extract_webpage_content(url):
     """使用pyppeteer提取网页主要内容"""
     for attempt in range(2):  # 最多尝试2次
         browser = await launch({
             'headless': True,
-            'args': ['--no-sandbox', '--disable-setuid-sandbox']
+            'handleSIGINT': False,  # 禁用SIGINT处理
+            'handleSIGTERM': False,  # 禁用SIGTERM处理
+            'handleSIGHUP': False,   # 禁用SIGHUP处理
+            'args': ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
         })
-        page = await browser.newPage()
         try:
+            page = await browser.newPage()
             # 设置更长的超时时间（90秒）
             await page.goto(url, {
                 'waitUntil': 'networkidle2',

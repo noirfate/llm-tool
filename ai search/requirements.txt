@@ -1,0 +1,6 @@
+duckduckgo_search==7.3.1
+nest_asyncio==1.6.0
+openai==1.61.1
+pyppeteer==2.0.0
+streamlit==1.42.0
+psutil==6.1.1

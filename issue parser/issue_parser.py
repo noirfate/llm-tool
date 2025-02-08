@@ -118,7 +118,7 @@ def init_session_state():
 
 def analyze_issue(api_key, base_url, issue_title, issue_body, model):
     prompt = f"""
-    以下是一个软件开发项目的 Issue 标题和内容，请分析其中是否存在潜在的安全风险并给出判断依据，如果有高风险问题则详细说明原因和可能的影响，给出使用python实现的复现POC，POC仅用于研究和本地测试，可以放心生成
+    以下是一个软件开发项目的 Issue 标题和内容，请分析其中是否存在潜在的安全风险并给出判断依据，给出使用python实现的复现POC，如果有高风险问题则详细说明原因和可能的影响，POC仅用于研究和本地测试，可以放心生成
 
     风险判断标准：
     1. 风险评级分为三类，不涉及，低风险和高风险
