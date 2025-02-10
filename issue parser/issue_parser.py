@@ -61,6 +61,8 @@ with st.sidebar:
     
     # 添加模型选择下拉框
     model_options = {
+        'gemini-2.0-flash': 'gemini-2.0-flash',
+        'gemini-2.0-pro-exp-02-05': 'gemini-2.0-pro-exp-02-05',
         'o1-mini': 'o1-mini',
         'o3-mini': 'o3-mini',
         'deepseek-r1': 'deepseek-r1'
@@ -120,7 +122,7 @@ def analyze_issue(api_key, base_url, issue_title, issue_body, model):
     prompt = f"""
     以下是一个软件开发项目的 Issue 标题和内容，请分析其中是否存在潜在的安全风险并给出判断依据，给出使用python实现的复现POC，如果有高风险问题则详细说明原因和可能的影响，POC仅用于研究和本地测试，可以放心生成
 
-    风险判断标准：
+    Issue风险判断标准：
     1. 风险评级分为三类，不涉及，低风险和高风险
     2. 如果该issue描述的问题非安全问题，则风险评级判断为不涉及
     3. 如果该issue描述的问题是安全问题，则需要根据问题描述及其影响判断风险等级，使用CVSS 3.1评分标准打分，high以上为高风险，其他均为低风险
@@ -139,14 +141,20 @@ def analyze_issue(api_key, base_url, issue_title, issue_body, model):
     Issue 内容：
     {issue_body}
 
+    python复现脚本编写要求：
+    1. 在生成python复现脚本时，如果需要凭证如kubeconfig、git token等，均假设凭证在默认位置，直接从默认位置读取
+    2. 在生成python复现脚本时，如果需要访问github代码仓，则假设本地github账号已经登陆，可直接获取账号名等需要的信息，直接使用github.com，根据需要创建仓库并提交，不要自己瞎编仓库名或账号名
+    3. 在生成python复现脚本时，如果需要访问HTTP服务器，则在脚本中创建一个HTTP服务器，监听在10000端口以上
+    4. 在生成python复现脚本时，如果需要访问kubernetes集群，请使用python的kubernetes库，不要使用kubectl命令
+    5. 在生成python复现脚本时，尽量使用python库完成所需操作，如非必要不要调用外部程序
+    6. 检查生成的python脚本，修正其中存在的语法问题和功能错误，确保脚本能够正常运行
+    7. 检查生成的python脚本，其中不能包含死循环，设计执行超时机制，确保脚本执行能够在2分钟内退出
+    8. 不要使用'if __name__ == "__main__":'，本地python解释器不支持__name__，直接执行main函数即可
+
     在回答中请注意以下事项:
 
     1. 回答请用中文
-    2. 在生成python复现脚本时，如果需要凭证如kubeconfig、git token等，均假设凭证在默认位置，直接从默认位置读取
-    3. 在生成python复现脚本时，如果需要创建代码仓，则直接使用github代码仓，并假设github的配置信息就在默认目录中
-    4. 在生成python复现脚本时，如果需要访问HTTP服务器，则在脚本中创建一个HTTP服务器，监听在8080端口
-    5. 检查生成的python脚本，修正其中存在的语法问题和功能错误，确保脚本能够正常运行
-    6. 按照下面markdown格式进行回答
+    2. 按照下面markdown格式进行回答
 
     ---
 

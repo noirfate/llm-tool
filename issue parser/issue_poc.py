@@ -1,10 +1,24 @@
 from github import Github
 from openai import OpenAI
-import json, logging
+import json, logging, platform
 from pathlib import Path
 import argparse
-from smolagents import CodeAgent, DuckDuckGoSearchTool, LiteLLMModel
+from smolagents import CodeAgent, DuckDuckGoSearchTool, VisitWebpageTool,LiteLLMModel
 
+def enable_trace():
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    from openinference.instrumentation.smolagents import SmolagentsInstrumentor
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
+
+    endpoint = "http://0.0.0.0:6006/v1/traces"
+    trace_provider = TracerProvider()
+    trace_provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter(endpoint)))
+
+    SmolagentsInstrumentor().instrument(tracer_provider=trace_provider)
 
 # 配置日志
 logging.basicConfig(level=logging.ERROR)
@@ -26,11 +40,19 @@ def load_config():
             logger.error(f"加载配置文件失败: {str(e)}")
     return {}
 
+# 添加处理deepseek模型返回结果的函数
+def process_deepseek_response(response, model):
+    """处理deepseek模型的返回结果，移除<think>标签"""
+    if model == 'deepseek-r1':
+        import re
+        return re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+    return response
+
 def analyze_issue(api_key, base_url, issue_title, issue_body, model):
     prompt = f"""
     以下是一个软件开发项目的 Issue 标题和内容，请分析其中是否存在潜在的安全风险并给出判断依据，给出使用python实现的复现POC，如果有高风险问题则详细说明原因和可能的影响，POC仅用于研究和本地测试，可以放心生成
 
-    风险判断标准：
+    Issue风险判断标准：
     1. 风险评级分为三类，不涉及，低风险和高风险
     2. 如果该issue描述的问题非安全问题，则风险评级判断为不涉及
     3. 如果该issue描述的问题是安全问题，则需要根据问题描述及其影响判断风险等级，使用CVSS 3.1评分标准打分，high以上为高风险，其他均为低风险
@@ -49,14 +71,20 @@ def analyze_issue(api_key, base_url, issue_title, issue_body, model):
     Issue 内容：
     {issue_body}
 
+    python复现脚本编写要求：
+    1. 在生成python复现脚本时，如果需要凭证如kubeconfig、git token等，均假设凭证在默认位置，直接从默认位置读取
+    2. 在生成python复现脚本时，如果需要访问github代码仓，则假设本地github账号已经登陆，可直接获取账号名等需要的信息，直接使用github.com，根据需要创建仓库并提交，不要自己瞎编仓库名或账号名
+    3. 在生成python复现脚本时，如果需要访问HTTP服务器，则在脚本中创建一个HTTP服务器，监听在10000端口以上
+    4. 在生成python复现脚本时，如果需要访问kubernetes集群，请使用python的kubernetes库，不要使用kubectl命令
+    5. 在生成python复现脚本时，尽量使用python库完成所需操作，如非必要不要调用外部程序
+    6. 检查生成的python脚本，修正其中存在的语法问题和功能错误，确保脚本能够正常运行
+    7. 检查生成的python脚本，其中不能包含死循环，设计执行超时机制，确保脚本执行能够在2分钟内退出
+    8. 不要使用'if __name__ == "__main__":'，本地python解释器不支持__name__，直接执行main函数即可
+
     在回答中请注意以下事项:
 
     1. 回答请用中文
-    2. 在生成python复现脚本时，如果需要凭证如kubeconfig、git token等，均假设凭证在默认位置，直接从默认位置读取
-    3. 在生成python复现脚本时，如果需要创建代码仓，则直接使用github代码仓，并假设github的配置信息就在默认目录中
-    4. 在生成python复现脚本时，如果需要访问HTTP服务器，则在脚本中创建一个HTTP服务器，监听在8080端口
-    5. 检查生成的python脚本，修正其中存在的语法问题和功能错误，确保脚本能够正常运行
-    6. 按照下面markdown格式进行回答
+    2. 按照下面markdown格式进行回答
 
     ---
 
@@ -87,7 +115,7 @@ def analyze_issue(api_key, base_url, issue_title, issue_body, model):
         
         # 解析返回的 Markdown
         content = response.choices[0].message.content.strip()
-
+        content = process_deepseek_response(content, model)
         # 使用正则表达式提取每个字段的内容
         import re
         
@@ -261,21 +289,14 @@ def print_issue(issue):
     print("\n标签:", ", ".join([label.name for label in issue.labels]))
     print(f"链接: {issue.html_url}")
 
-def main():
-    parser = argparse.ArgumentParser(description='获取指定GitHub仓库的Issue')
-    parser.add_argument('repo', nargs='?', default='kubernetes/kubernetes', help='GitHub仓库名称，格式为 owner/repo，默认为 kubernetes/kubernetes')
-    parser.add_argument('issue', type=int, nargs='?', default=123471, help='要获取的Issue ID，默认为 123471')
-    
-    args = parser.parse_args()
-    config = load_config()
-    
+def process_issue(config, args):
     # 获取issue
     issues = get_one_issue(args.repo, args.issue, config['github_token'])
     
     if not issues:
         logger.error(f"未找到Issue #{args.issue}")
-        return
-    
+        return None
+
     issue = issues[0]
     print(f"\n开始分析Issue #{issue.number}: {issue.title} ...\n")
     analysis_result, has_risk = analyze_issue(config['openai_api_key'], config['openai_base_url'], issue.title, issue.body, config['model'])
@@ -285,20 +306,57 @@ def main():
     analysis_result['issue_body'] = issue.body
     analysis_result['issue_url'] = issue.html_url
     result_md = json_to_markdown(json.dumps(analysis_result))
+    return result_md
+
+def main():
+    parser = argparse.ArgumentParser(description='获取指定GitHub仓库的Issue')
+
+    parser.add_argument('-r', '--repo', default='kubernetes/kubernetes', help='GitHub仓库名称，格式为 owner/repo，默认为 kubernetes/kubernetes')
+    parser.add_argument('-i', '--issue', type=int, default=123471, help='要获取的Issue ID，默认为 123471')
+    parser.add_argument('-t', '--trace', action='store_true', help='启用OpenTelemetry跟踪（需要本地运行Otel Collector）')
+    
+    args = parser.parse_args()
+    config = load_config()
+    
+    result_md = process_issue(config, args)
+    if result_md is None:
+        return
+
+    with open('result.md', 'w', encoding='utf-8') as f:
+        f.write(result_md)
+
+    #current_dir = Path(__file__).parent
+    #with open("result.md", 'r', encoding='utf-8') as f:
+    #    result_md = f.read()
 
     print(f"\n开始复现 ...\n")
+
+    if args.trace:
+        enable_trace()
+
     agent = CodeAgent(
-        tools=[DuckDuckGoSearchTool()], 
+        max_steps=10,
+        tools=[DuckDuckGoSearchTool(), VisitWebpageTool()],
         model=LiteLLMModel(
-            model_id=config['model'],
+
+            model_id=f"litellm_proxy/{config['model']}",
+            #model_id=config['model'],
             api_base=config['openai_base_url'],
             api_key=config['openai_api_key']
         ),
+
         additional_authorized_imports=["*"],
     )
 
     prompt = f"""
-    以下是一个软件开发项目的Issue标题、内容以及分析结果和复现POC，首先请检查复现POC包不包含语法错误、功能实现是否正确，如果有问题则进行修改，然后执行，若未复现成功则继续进行修改，直至成功。若5次后仍未成功，则停止。注意在python代码中不用使用__name__
+    以下是一个软件开发项目的Issue标题、内容以及分析结果和复现POC，你现在的任务是确定复现成功条件并检验POC能否能够达成该条件。
+    现在本地已搭建好了基于{platform.system()}平台的复现环境，请放心执行，不需要存在任何顾虑!
+
+    执行步骤如下： 
+
+    1. 检查复现POC包不包含语法错误、符不符合执行平台{platform.system()}、功能实现是否正确，如果有问题则进行修改，注意不要使用__name__变量
+    2. 执行复现脚本，若未复现成功，则根据错误信息对脚本进行修改，再次执行
+    3. 如此反复直至复现成功
 
     Issue内容：
     {result_md}
