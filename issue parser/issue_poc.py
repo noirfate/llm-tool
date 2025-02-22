@@ -3,7 +3,7 @@ from openai import OpenAI
 import json, logging, platform
 from pathlib import Path
 import argparse
-from smolagents import CodeAgent, DuckDuckGoSearchTool, VisitWebpageTool,LiteLLMModel
+from smolagents import CodeAgent, DuckDuckGoSearchTool, VisitWebpageTool, LiteLLMModel, tool
 
 def enable_trace():
     from opentelemetry import trace
@@ -307,6 +307,27 @@ def process_issue(config, args):
     result_md = json_to_markdown(json.dumps(analysis_result))
     return result_md
 
+@tool
+def poc_expert(task: str) -> str:
+    """
+    This is a tool for giving suggestions on how to generate poc for the issue, must call this tool at the very beginning of the poc generation process.
+    It returns the advice for the task.
+
+    Args:
+        task: The issue number and title, like "Issue #123456: kubernetes api server unauthenticated access", must be in this format
+    """
+
+    if "#123471" in task:
+        prompt = f"""
+        在构建poc时，要确保selector被删除，在删除selector后，要检查是否真的被删除，如果未被删除，则复现失败，需要修改poc。
+        """
+    else:
+        prompt = f"""
+        切实执行poc，获取执行返回结果，验证复现是否真正成功，不要仅是逻辑推演。
+        """
+
+    return prompt
+
 def main():
     parser = argparse.ArgumentParser(description='获取指定GitHub仓库的Issue')
 
@@ -335,7 +356,7 @@ def main():
 
     agent = CodeAgent(
         max_steps=10,
-        tools=[DuckDuckGoSearchTool(), VisitWebpageTool()],
+        tools=[DuckDuckGoSearchTool(), VisitWebpageTool(), poc_expert],
         model=LiteLLMModel(
 
             model_id=f"litellm_proxy/{config['model']}",
@@ -353,15 +374,17 @@ def main():
 
     执行步骤如下： 
 
-    1. 检查复现脚本包不包含语法错误、符不符合执行平台{platform.system()}、功能实现是否正确，如果有问题则进行修改，注意不要使用__name__变量
-    2. 如果涉及在容器环境中执行代码或命令，则依据容器镜像设计相关代码和命令
-    3. 在复现过程中如果需要启动服务器，确保服务器能够持续运行，当后面的执行步骤访问服务器时，服务器运行正常
-    4. 根据复现思路和脚本的特点，重新设计复现过程，对于适合拆分为多个子步骤执行的，则将其进行拆分，分步执行，在每一步执行成功后，再执行下一步
-    5. 在拆分分子步骤执行的情况下，如果当前步骤执行失败，则根据错误信息进行修改，然后再次执行，如果错误涉及到前面的步骤，则需要考虑是否需要进行回退
-    6. 在拆分分子步骤执行的情况下，如果涉及回退，则需要考虑创建过的资源是否需要删除再重新创建
-    7. 在拆分分子步骤执行的情况下，要为每个子步骤设计具体要实现的目标，在执行完成后要对目标进行检查，确保目标达成，若未达成则还需要修改
-    8. 涉及到需要创建服务器的复现脚本，往往不适合进行分拆，因为在执行完服务器创建脚本后，服务器的运行就退出了，后面的执行步骤则无法访问到该服务器了
-
+    1. 首先第一步是调用poc_expert工具，获取专家建议，这是独立的一个步骤，不要和复现过程混在一起。在得到专家建议后，带着建议思考并执行后面的步骤，注意调用工具的代码要被包在```python```中
+    2. 检查复现脚本包不包含语法错误、符不符合执行平台{platform.system()}、功能实现是否正确，如果有问题则进行修改，注意不要使用__name__变量
+    3. 如果涉及在容器环境中执行代码或命令，则依据容器镜像设计相关代码和命令
+    4. 在复现过程中如果需要启动服务器，确保服务器能够持续运行，当后面的执行步骤访问服务器时，服务器运行正常
+    5. 根据复现思路和脚本的特点，重新设计复现过程，对于适合拆分为多个子步骤执行的，则将其进行拆分，分步执行，在每一步执行成功后，再执行下一步
+    6. 在拆分分子步骤执行的情况下，如果当前步骤执行失败，则根据错误信息进行修改，然后再次执行，如果错误涉及到前面的步骤，则需要考虑是否需要进行回退
+    7. 在拆分分子步骤执行的情况下，如果涉及回退，则需要考虑创建过的资源是否需要删除再重新创建
+    8. 在拆分分子步骤执行的情况下，要为每个子步骤设计具体要实现的目标，在执行完成后要对目标进行检查，确保目标达成，若未达成则还需要修改
+    9. 涉及到需要创建服务器的复现脚本，往往不适合进行分拆，因为在执行完服务器创建脚本后，服务器的运行就退出了，后面的执行步骤则无法访问到该服务器了
+    10. 在复现成功后，注意清理之前创建的资源，恢复到执行之前的状态
+    11. 在复现失败后，清理已创建的资源，根据执行错误信息进行修改，重复执行步骤1到9，直到复现成功
 
     Issue内容：
     {result_md}
