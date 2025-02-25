@@ -328,7 +328,7 @@ def expert_advice(task: str) -> str:
 
         【1. 创建git仓库】
 
-        本地已配置好了github凭证可直接使用，首先使用`git config user.name`获取github登陆账号，然后使用gh命令创建一个git仓库。不要修改github账号名！
+        本地已配置好了github凭证可直接使用，首先使用`git config user.name`获取github登陆账号，然后创建一个git仓库。不要修改github账号名！
         该issue的利用需要创建一个包含两层.git目录的仓库，下面是在linux平台下的git仓库的创建方法示例，如果是在windows平台下，则需要修改其中一些命令
         ```bash
         # Initiate a new git repo
@@ -359,7 +359,7 @@ def expert_advice(task: str) -> str:
         【2. 创建pod】
         在kubernetes集群中创建pod中使用gitrepo volume driver，指向上一步创建好的github仓库，当pod创建成功后，会在容器的/tmp/poc中存放id命令的执行结果，如果存在则说明复现成功，不存在则失败
 
-        **注意：复现大概率无法一次成功，在复现过程中一旦成功创建github仓库，后面直接使用即可，不要重复创建**
+        **注意：复现大概率无法一次成功，在复现过程中一旦成功将仓库push到github上，后面直接使用即可，不要重复push**
         """
     else:
         prompt = f"""
