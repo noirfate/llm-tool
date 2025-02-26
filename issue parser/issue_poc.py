@@ -388,10 +388,11 @@ def main():
     parser.add_argument('-r', '--repo', default='kubernetes/kubernetes', help='GitHub仓库名称，格式为 owner/repo，默认为 kubernetes/kubernetes')
     parser.add_argument('-i', '--issue', type=int, default=123471, help='要获取的Issue ID，默认为 123471')
     parser.add_argument('-t', '--trace', action='store_true', help='启用OpenTelemetry跟踪（需要本地运行phoenix.server）')
+    parser.add_argument('-d', '--debug', action='store_true', help='启用debug模式，直接读取当前目录的result.md文件')
     
     args = parser.parse_args()
     config = load_config()
-    result_md = get_issue_info(config, args, True)
+    result_md = get_issue_info(config, args, args.debug)
 
     print(f"\n开始复现 ...\n")
 
