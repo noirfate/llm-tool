@@ -361,9 +361,17 @@ def expert_advice(task: str) -> str:
 
         **注意：复现大概率无法一次成功，在复现过程中一旦成功将仓库push到github上，后面直接使用即可，不要重复push**
         """
+    elif "#130016" in task:
+        prompt = f"""
+        1. 复现脚本只需要检查能否访问kubelet服务和存储路径即可，无需其他额外的检查，如不要检查containerd、docker等容器运行时。
+        2. kubelet的访问地址是：http://127.0.0.1:10255
+        3. 创建checkpoint前首先需要创建一个pod，之后为这个pod创建checkpoint
+        4. checkpoint的请求格式为`POST /checkpoint/{{namespace}}/{{pod}}/{{container}}`
+        5. 复现脚本中不要使用`__name__`、`sys.exit`。
+        """
     else:
         prompt = f"""
-        切实执行复现脚本，获取执行返回结果，验证复现是否真正成功，每次回复都要包含```python```代码块，在达到成功条件时调用final_answer工具。
+        切实执行复现脚本，获取执行返回结果，验证复现是否真正成功，每次回复都要包含```python```代码块，不要使用`__name__`，在达到成功条件时调用final_answer工具。
         """
 
     return prompt
