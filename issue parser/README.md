@@ -52,6 +52,7 @@ Google Project Zero构建的`Naptime`项目，旨在评估大模型在漏洞挖�
 ### Issue复现
 `issue_poc.py`是一个命令行的issue复现工具，它利用`issue_parser.py`的分析代码从github上获取issue信息，并用大模型编写复现脚本，在本地环境上进行复现
 - 使用方法
+需要先安装`smolagents`框架，目前官方最新版是`1.9.2`，安装完成之后用仓库中的`local_python_executor.py`替换原始文件，然后运行
 `python issue_poc.py`
 - 经验教训
     - issue的分析内容放在编写复现脚本要求的后面效果更好，模型更能遵从复现要求
