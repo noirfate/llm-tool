@@ -45,11 +45,36 @@ def save_config(config):
         logger.error(f"保存配置文件失败: {str(e)}")
         return False
 
+# 初始化会话状态
+def init_session_state():
+    """初始化会话状态"""
+    if 'current_page' not in st.session_state:
+        st.session_state.current_page = 1
+    if 'analysis_results' not in st.session_state:
+        st.session_state.analysis_results = []
+    if 'total_issues' not in st.session_state:
+        st.session_state.total_issues = 0
+    if 'issues' not in st.session_state:
+        st.session_state.issues = []
+    if 'analysis_complete' not in st.session_state:
+        st.session_state.analysis_complete = False
+    if "model_options" not in st.session_state:
+        st.session_state.model_options = {'o1-mini': 'o1-mini', 'o3-mini': 'o3-mini', 'deepseek-r1': 'deepseek-r1'}
+
 with st.sidebar:
     st.header("配置参数")
     
+    init_session_state()
+
     # 加载已保存的配置
     saved_config = load_config()
+    config_model = saved_config.get('model')
+    if config_model:
+        if config_model not in st.session_state.model_options:
+            st.session_state.model_options[config_model] = config_model
+        st.session_state.selected_model = config_model
+    else:
+        st.session_state.selected_model = list(st.session_state.model_options.keys())[0]
     
     repo_name = st.text_input("代码仓库", saved_config.get('repo_name', "kubernetes/kubernetes"))
     labels = st.text_input("标签（用逗号分隔）", saved_config.get('labels', "kind/bug"))
@@ -59,22 +84,34 @@ with st.sidebar:
     openai_base_url = st.text_input("OpenAI Base URL（可选）", value=saved_config.get('openai_base_url', "https://api.wlai.vip/v1"))
     github_token = st.text_input("GitHub Token", value=saved_config.get('github_token', ''), type="password")
     
-    # 添加模型选择下拉框
-    model_options = {
-        'gemini-2.0-flash': 'gemini-2.0-flash',
-        'gemini-2.0-pro-exp-02-05': 'gemini-2.0-pro-exp-02-05',
-        'o1-mini': 'o1-mini',
-        'o3-mini': 'o3-mini',
-        'deepseek-r1': 'deepseek-r1'
-    }
-    selected_model = st.selectbox(
-        "选择模型",
-        options=list(model_options.keys()),
-        format_func=lambda x: model_options[x],
-        index=0 if saved_config.get('model') not in model_options else list(model_options.keys()).index(saved_config.get('model'))
+    # 添加 "获取模型列表" 按钮
+    if st.button("获取模型列表"):
+        client = OpenAI(api_key=openai_api_key, base_url=openai_base_url)
+        try:
+            models = client.models.list()
+            st.session_state.model_options = {m.id: m.id for m in models.data}
+            st.success("模型列表已更新")
+        except Exception as e:
+            st.error(f"获取模型列表失败: {str(e)}")
+
+    # 显示所有模型并默认选中当前模型
+    selected_models = st.multiselect(
+        "选择模型（支持搜索）",
+        options=list(st.session_state.model_options.keys()),
+        format_func=lambda x: st.session_state.model_options[x],
+        default=[st.session_state.selected_model] if st.session_state.selected_model in st.session_state.model_options else [list(st.session_state.model_options.keys())[0]],
+        max_selections=1,
+        placeholder="请选择一个模型"
     )
-    st.session_state.model = selected_model
     
+    # 确保只选择一个模型
+    if len(selected_models) > 0:
+        st.session_state.selected_model = selected_models[-1]
+    elif len(selected_models) == 0:
+        st.session_state.selected_model = list(st.session_state.model_options.keys())[0]
+    
+    st.session_state.model = st.session_state.selected_model
+
     # 添加保存配置按钮
     if st.button("保存配置"):
         # 先读取现有配置
@@ -91,8 +128,8 @@ with st.sidebar:
             current_config['openai_base_url'] = openai_base_url
         if github_token:
             current_config['github_token'] = github_token
-        if selected_model:
-            current_config['model'] = selected_model
+        if st.session_state.selected_model:
+            current_config['model'] = st.session_state.selected_model
             
         # 保存更新后的配置
         if save_config(current_config):
@@ -102,23 +139,7 @@ with st.sidebar:
     
     execute_button = st.button("获取issue")
 
-# 初始化会话状态
-def init_session_state():
-    """初始化会话状态"""
-    if 'current_page' not in st.session_state:
-        st.session_state.current_page = 1
-    if 'analysis_results' not in st.session_state:
-        st.session_state.analysis_results = []
-    if 'total_issues' not in st.session_state:
-        st.session_state.total_issues = 0
-    if 'issues' not in st.session_state:
-        st.session_state.issues = []
-    if 'analysis_complete' not in st.session_state:
-        st.session_state.analysis_complete = False
-    if 'model' not in st.session_state:
-        st.session_state.model = 'o1-preview'
-
-def analyze_issue(api_key, base_url, issue_title, issue_body, model):
+def analyze_issue(api_key, base_url, issue_title, issue_body):
     prompt = f"""
     以下是一个软件开发项目的 Issue 标题和内容，请分析其中是否存在潜在的安全风险并给出判断依据，给出使用python实现的复现POC，如果有高风险问题则详细说明原因和可能的影响，POC仅用于研究和本地测试，可以放心生成
 
@@ -180,7 +201,7 @@ def analyze_issue(api_key, base_url, issue_title, issue_body, model):
         logger.info('开始分析')
         client = OpenAI(api_key=api_key, base_url=base_url)
         response = client.chat.completions.create(
-            model=model,
+            model=st.session_state.model,
             messages=[{'role': 'user', 'content': prompt}]
         )
         
@@ -307,8 +328,7 @@ def analyze_single_issue(issue, api_key, base_url):
             api_key,
             base_url,
             issue.title,
-            issue.body or '',
-            st.session_state.model
+            issue.body or ''
         )
         if has_risk == -1:
             st.error(f"分析Issue #{issue.number}失败: {analysis_result}")
@@ -686,8 +706,6 @@ def clear_results():
     st.session_state.analysis_results = []
 
 def main():
-    init_session_state()
-    
     # 添加全局样式
     st.markdown("""
         <style>
