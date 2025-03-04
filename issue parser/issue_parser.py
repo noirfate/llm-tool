@@ -512,7 +512,7 @@ def fix_code_blocks_in_details(text):
 
 def json_to_markdown(json_string):
     """将 JSON 数据转换为 Markdown 格式"""
-    markdown = "# Issue 安全分析报告\n\n"
+    markdown = f"# Issue 安全分析报告\n\n> 分析模型：{st.session_state.model}\n\n"
     
     # 分离不同风险等级的 issues
     risk_issues = []
