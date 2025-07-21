@@ -139,9 +139,126 @@ with st.sidebar:
     
     execute_button = st.button("获取issue")
 
-def analyze_issue(api_key, base_url, issue_title, issue_body):
+def get_issue_details(issue, github_token):
+    """
+    获取issue的详细信息，包括评论和相关的commit
+    
+    Args:
+        issue: GitHub issue对象
+        github_token: GitHub token
+    
+    Returns:
+        dict: 包含issue详细信息的字典
+    """
+    try:
+        g = Github(github_token)
+        
+        # 获取评论
+        comments = []
+        try:
+            issue_comments = issue.get_comments()
+            for comment in issue_comments:
+                comments.append({
+                    'author': comment.user.login,
+                    'created_at': comment.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+                    'body': comment.body
+                })
+        except Exception as e:
+            logger.warning(f"获取Issue #{issue.number}的评论失败: {str(e)}")
+        
+        # 获取相关的commit（通过issue body和comments中的commit引用）
+        commits = []
+        try:
+            repo = g.get_repo(issue.repository.full_name)
+            
+            # 从issue body和评论中查找commit引用
+            all_text = (issue.body or '') + '\n'
+            for comment in comments:
+                all_text += comment['body'] + '\n'
+            
+            # 查找commit SHA（40位十六进制字符串）
+            import re
+            commit_pattern = r'\b[a-f0-9]{40}\b'
+            commit_shas = re.findall(commit_pattern, all_text.lower())
+            
+            # 查找短commit SHA（7-12位十六进制字符串，在github链接中）
+            short_commit_pattern = r'github\.com/[^/]+/[^/]+/commit/([a-f0-9]{7,12})'
+            short_shas = re.findall(short_commit_pattern, all_text.lower())
+            
+            # 合并所有找到的commit SHA，限制数量避免patch内容过多
+            all_shas = list(set(commit_shas + short_shas))[:3]  # 最多获取3个commit，避免patch内容过大
+            
+            for sha in all_shas:
+                try:
+                    commit = repo.get_commit(sha)
+                    
+                    # 获取commit的patch内容
+                    patch_content = ""
+                    try:
+                        # 获取每个文件的patch
+                        patches = []
+                        for file in commit.files:
+                            if hasattr(file, 'patch') and file.patch:
+                                patches.append(f"--- {file.filename} ---\n{file.patch}")
+                        patch_content = "\n\n".join(patches)
+                        
+                        # 限制patch内容长度，避免超过token限制
+                        if len(patch_content) > 10000:  # 限制为10000字符
+                            patch_content = patch_content[:10000] + "\n... (patch内容已截断)"
+                            
+                    except Exception as e:
+                        logger.debug(f"获取commit {sha}的patch失败: {str(e)}")
+                        patch_content = "无法获取patch内容"
+                    
+                    commits.append({
+                        'sha': commit.sha,
+                        'message': commit.commit.message,
+                        'author': commit.commit.author.name,
+                        'date': commit.commit.author.date.strftime('%Y-%m-%d %H:%M:%S'),
+                        'url': commit.html_url,
+                        'files_changed': [f.filename for f in commit.files],
+                        'patch': patch_content
+                    })
+                except Exception as e:
+                    logger.debug(f"获取commit {sha}失败: {str(e)}")
+                    
+        except Exception as e:
+            logger.warning(f"获取Issue #{issue.number}的相关commit失败: {str(e)}")
+        
+        return {
+            'comments': comments,
+            'commits': commits
+        }
+        
+    except Exception as e:
+        logger.error(f"获取Issue #{issue.number}的详细信息失败: {str(e)}")
+        return {'comments': [], 'commits': []}
+
+def analyze_issue(api_key, base_url, issue_title, issue_body, issue_details=None):
+    # 构建完整的分析内容
+    analysis_content = f"Issue 标题：\n{issue_title}\n\nIssue 内容：\n{issue_body or '无内容'}\n"
+    
+    # 添加评论信息
+    if issue_details and issue_details.get('comments'):
+        analysis_content += "\n评论信息：\n"
+        for i, comment in enumerate(issue_details['comments'], 1):
+            analysis_content += f"\n评论{i} (作者: {comment['author']}, 时间: {comment['created_at']}):\n{comment['body']}\n"
+    
+    # 添加相关commit信息
+    if issue_details and issue_details.get('commits'):
+        analysis_content += "\n相关Commit信息：\n"
+        for commit in issue_details['commits']:
+            analysis_content += f"\nCommit: {commit['sha'][:8]}\n"
+            analysis_content += f"作者: {commit['author']}\n"
+            analysis_content += f"时间: {commit['date']}\n"
+            analysis_content += f"消息: {commit['message']}\n"
+            if commit['files_changed']:
+                analysis_content += f"修改文件: {', '.join(commit['files_changed'])}\n"
+            if commit.get('patch'):
+                analysis_content += f"代码变更内容:\n```diff\n{commit['patch']}\n```\n"
+
     prompt = f"""
-    以下是一个软件开发项目的 Issue 标题和内容，请分析其中是否存在潜在的安全风险并给出判断依据，给出使用python实现的复现POC，如果有高风险问题则详细说明原因和可能的影响，POC仅用于研究和本地测试，可以放心生成
+    以下是一个软件开发项目的 Issue 标题、内容、评论和相关commit信息，请分析其中是否存在潜在的安全风险并给出判断依据，给出使用python实现的复现POC，如果有高风险问题则详细说明原因和可能的影响，POC仅用于研究和本地测试，可以放心生成
 
     Issue风险判断标准：
     1. 风险评级分为三类，不涉及，低风险和高风险
@@ -155,12 +272,11 @@ def analyze_issue(api_key, base_url, issue_title, issue_body):
     9. 如果issue中提供的内容不够充分，则根据issue可能导致的后果判断风险评级
     10. 针对高风险问题，必须给出使用python编写的复现脚本，该脚本的作用是在真实环境中复现该问题
     11. 对于细节缺失的高风险问题，要根据问题描述进行合理推演，给出python复现脚本
+    12. 在分析时，需要特别关注评论中提供的技术细节、讨论内容和相关commit中的代码变更，这些信息经常包含重要的安全相关信息
+    13. 如果提供了commit的代码变更内容（patch），需要仔细分析代码变更是否引入了新的安全问题，或者是否修复了现有的安全漏洞
+    14. 根据代码变更的具体内容，可以更准确地判断漏洞的影响范围和严重程度
 
-    Issue 标题：
-    {issue_title}
-
-    Issue 内容：
-    {issue_body}
+    {analysis_content}
 
     python复现脚本编写要求：
     1. 在生成python复现脚本时，如果需要凭证如kubeconfig、git token等，均假设凭证在默认位置，直接从默认位置读取
@@ -300,6 +416,30 @@ def display_issue(issue, analysis=None):
                     issue_content = issue_content.replace('\n', '  \n')
                 st.markdown(f"**Issue 内容：**  \n{issue_content}")
                 
+                # 显示评论信息
+                if analysis and analysis.get('comments'):
+                    st.markdown("**相关评论：**")
+                    for i, comment in enumerate(analysis['comments'], 1):
+                        st.markdown(f"**评论{i}** - {comment['author']} ({comment['created_at']})")
+                        comment_text = comment['body'].replace('\n', '  \n') if comment['body'] else '无内容'
+                        st.markdown(f"> {comment_text}")
+                        st.markdown("---")
+
+                # 显示相关commit信息
+                if analysis and analysis.get('commits'):
+                    st.markdown("**相关Commit：**")
+                    for commit in analysis['commits']:
+                        st.markdown(f"**Commit: {commit['sha'][:8]}** - {commit['author']} ({commit['date']})")
+                        st.markdown(f"消息: {commit['message']}")
+                        if commit['files_changed']:
+                            files_text = ', '.join(commit['files_changed'])
+                            st.markdown(f"修改文件: {files_text}")
+                        if commit.get('patch'):
+                            st.markdown("**代码变更：**")
+                            st.code(commit['patch'], language="diff")
+                        st.markdown(f"[查看详情]({commit['url']})")
+                        st.markdown("---")
+
                 # 处理分析结果的换行
                 if analysis:
                     analysis_data = analysis['analysis']  # 获取分析结果
@@ -318,17 +458,19 @@ def display_issue(issue, analysis=None):
             st.markdown('<div class="analyze-button">', unsafe_allow_html=True)
             button_text = "重新分析" if analysis else "分析"
             st.button(button_text, key=f"analyze_{issue.number}", type="secondary", use_container_width=True,
-                     on_click=analyze_single_issue, args=(issue, openai_api_key, openai_base_url))
+                     on_click=analyze_single_issue, args=(issue, openai_api_key, openai_base_url, github_token))
             st.markdown('</div>', unsafe_allow_html=True)
 
-def analyze_single_issue(issue, api_key, base_url):
+def analyze_single_issue(issue, api_key, base_url, github_token):
     """分析单个issue的辅助函数"""
     try:
+        issue_details = get_issue_details(issue, github_token) # 获取issue的详细信息
         analysis_result, has_risk = analyze_issue(
             api_key,
             base_url,
             issue.title,
-            issue.body or ''
+            issue.body or '',
+            issue_details # 传递issue的详细信息
         )
         if has_risk == -1:
             st.error(f"分析Issue #{issue.number}失败: {analysis_result}")
@@ -340,7 +482,9 @@ def analyze_single_issue(issue, api_key, base_url):
             'issue_url': issue.html_url,
             'analysis': analysis_result,
             'has_risk': has_risk,
-            'issue_body': issue.body or ''
+            'issue_body': issue.body or '',
+            'comments': issue_details['comments'], # 添加评论信息
+            'commits': issue_details['commits'] # 添加commit信息
         }
         
         if 'analysis_results' not in st.session_state:
@@ -537,6 +681,31 @@ def json_to_markdown(json_string):
             content += f"{issue_content}\n\n"
         else:
             content += "无内容\n\n"
+        
+        # 添加评论信息
+        if item.get('comments'):
+            content += "### 相关评论\n\n"
+            for i, comment in enumerate(item['comments'][:5], 1):  # 最多导出5条评论
+                content += f"#### 评论{i} - {comment['author']} ({comment['created_at']})\n\n"
+                if comment['body']:
+                    comment_content = comment['body'].replace('### ', '##### ')
+                    content += f"{comment_content}\n\n"
+                else:
+                    content += "无内容\n\n"
+        
+        # 添加相关commit信息
+        if item.get('commits'):
+            content += "### 相关Commit\n\n"
+            for commit in item['commits']:
+                content += f"#### Commit: {commit['sha'][:8]}\n\n"
+                content += f"- **作者：** {commit['author']}\n"
+                content += f"- **时间：** {commit['date']}\n"
+                content += f"- **消息：** {commit['message']}\n"
+                if commit['files_changed']:
+                    content += f"- **修改文件：** {', '.join(commit['files_changed'])}\n"
+                if commit.get('patch'):
+                    content += f"- **代码变更：**\n\n```diff\n{commit['patch']}\n```\n\n"
+                content += f"- **链接：** [{commit['sha'][:8]}]({commit['url']})\n\n"
         
         # 添加分析结果
         content += "### 分析结果\n\n"
@@ -776,7 +945,7 @@ def main():
             for idx, issue in enumerate(current_issues):
                 if not any(r['issue_number'] == issue.number for r in st.session_state.analysis_results):
                     progress_text.text(f'正在分析 Issue #{issue.number}...')
-                    analyze_single_issue(issue, openai_api_key, openai_base_url)
+                    analyze_single_issue(issue, openai_api_key, openai_base_url, github_token)
                 progress_bar.progress((idx + 1) / len(current_issues))
             
             progress_text.text('分析完成！')
