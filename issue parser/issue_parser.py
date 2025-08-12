@@ -166,64 +166,112 @@ def get_issue_details(issue, github_token):
         except Exception as e:
             logger.warning(f"获取Issue #{issue.number}的评论失败: {str(e)}")
         
-        # 获取相关的commit（通过issue body和comments中的commit引用）
+        # 获取相关的commit/PR
         commits = []
         try:
-            repo = g.get_repo(issue.repository.full_name)
-            
-            # 从issue body和评论中查找commit引用
+            # 解析仓库 fullname，兼容不同来源的 Issue 对象
+            try:
+                repo_fullname = issue.repository.full_name  # type: ignore[attr-defined]
+            except Exception:
+                # 从 html_url 兜底解析 owner/repo
+                import re as _re
+                m = _re.search(r'github\.com/([^/]+)/([^/]+)/issues/\\d+', issue.html_url)
+                repo_fullname = f"{m.group(1)}/{m.group(2)}" if m else None
+            if not repo_fullname:
+                raise RuntimeError("无法解析仓库名")
+
+            repo = g.get_repo(repo_fullname)
+
+            # 汇总文本用于正则提取 PR/commit URL
+            import re
             all_text = (issue.body or '') + '\n'
             for comment in comments:
-                all_text += comment['body'] + '\n'
-            
-            # 查找commit SHA（40位十六进制字符串）
-            import re
-            commit_pattern = r'\b[a-f0-9]{40}\b'
-            commit_shas = re.findall(commit_pattern, all_text.lower())
-            
-            # 查找短commit SHA（7-12位十六进制字符串，在github链接中）
-            short_commit_pattern = r'github\.com/[^/]+/[^/]+/commit/([a-f0-9]{7,12})'
-            short_shas = re.findall(short_commit_pattern, all_text.lower())
-            
-            # 合并所有找到的commit SHA，限制数量避免patch内容过多
-            all_shas = list(set(commit_shas + short_shas))[:3]  # 最多获取3个commit，避免patch内容过大
-            
-            for sha in all_shas:
+                all_text += (comment.get('body') or '') + '\n'
+
+            # 1) 从文本中提取 PR URL 中的编号
+            pr_nums_from_text = set(re.findall(r'github\\.com/[^/]+/[^/]+/pull/(\\d+)', all_text))
+
+            # 2) 搜索引用当前 Issue 的 PR（如 Fixes #<num>/Closes #<num>/Resolves #<num> 等）
+            pr_nums_from_search = set()
+            try:
+                search_queries = [
+                    f"repo:{repo_fullname} is:pr in:body {issue.number}",
+                    f"repo:{repo_fullname} is:pr in:title {issue.number}",
+                ]
+                for q in search_queries:
+                    for pr_issue in g.search_issues(q):
+                        if pr_issue.pull_request is not None:  # 确认是PR
+                            pr_nums_from_search.add(str(pr_issue.number))
+            except Exception as e:
+                logger.debug(f"搜索关联PR失败: {str(e)}")
+
+            related_pr_numbers = list({*pr_nums_from_text, *pr_nums_from_search})
+
+            # 3) 从文本中提取 commit URL
+            #    捕获 owner、repo、sha，其中仅处理 40位完整 sha
+            commit_urls = re.findall(r'github\\.com/([^/]+)/([^/]+)/commit/([a-f0-9]{7,40})', all_text.lower())
+            related_commits = []
+            for owner, name, sha in commit_urls:
+                if len(sha) != 40:
+                    continue  # 跳过短SHA，避免误命中如 cb33accc
+                related_commits.append((f"{owner}/{name}", sha))
+
+            # 先处理关联 PR：直接从 PR 收集 patch（比散落commit链接更可靠）
+            for pr_num_str in related_pr_numbers:
                 try:
-                    commit = repo.get_commit(sha)
-                    
-                    # 获取commit的patch内容
-                    patch_content = ""
-                    try:
-                        # 获取每个文件的patch
-                        patches = []
-                        for file in commit.files:
-                            if hasattr(file, 'patch') and file.patch:
-                                patches.append(f"--- {file.filename} ---\n{file.patch}")
-                        patch_content = "\n\n".join(patches)
-                        
-                        # 限制patch内容长度，避免超过token限制
-                        if len(patch_content) > 10000:  # 限制为10000字符
-                            patch_content = patch_content[:10000] + "\n... (patch内容已截断)"
-                            
-                    except Exception as e:
-                        logger.debug(f"获取commit {sha}的patch失败: {str(e)}")
-                        patch_content = "无法获取patch内容"
-                    
+                    pr_num = int(pr_num_str)
+                    pr = repo.get_pull(pr_num)
+
+                    # 聚合 PR 的文件级 patch
+                    file_patches = []
+                    files = list(pr.get_files())
+                    for f in files:
+                        if hasattr(f, 'patch') and f.patch:
+                            file_patches.append(f"--- {f.filename} ---\n{f.patch}")
+                    patch_content = "\n\n".join(file_patches)
+                    if patch_content and len(patch_content) > 20000:
+                        patch_content = patch_content[:20000] + "\n... (patch内容已截断)"
+
+                    commits.append({
+                        'sha': (pr.head.sha if pr.head and pr.head.sha else f"PR#{pr.number}"),
+                        'message': pr.title or '',
+                        'author': (pr.user.login if pr.user else ''),
+                        'date': pr.created_at.strftime('%Y-%m-%d %H:%M:%S') if pr.created_at else '',
+                        'url': pr.html_url,
+                        'files_changed': [f.filename for f in files],
+                        'patch': patch_content or ''
+                    })
+                except Exception as e:
+                    logger.debug(f"获取PR #{pr_num_str}详情失败: {str(e)}")
+
+            # 再处理明确的 commit URL（仅完整40位sha）
+            for full_repo, sha in related_commits:
+                try:
+                    repo_obj = repo if full_repo.lower() == repo_fullname.lower() else g.get_repo(full_repo)
+                    commit = repo_obj.get_commit(sha)
+
+                    patches = []
+                    for file in commit.files:
+                        if hasattr(file, 'patch') and file.patch:
+                            patches.append(f"--- {file.filename} ---\n{file.patch}")
+                    patch_content = "\n\n".join(patches)
+                    if patch_content and len(patch_content) > 10000:
+                        patch_content = patch_content[:10000] + "\n... (patch内容已截断)"
+
                     commits.append({
                         'sha': commit.sha,
                         'message': commit.commit.message,
-                        'author': commit.commit.author.name,
-                        'date': commit.commit.author.date.strftime('%Y-%m-%d %H:%M:%S'),
+                        'author': commit.commit.author.name if commit.commit and commit.commit.author else '',
+                        'date': commit.commit.author.date.strftime('%Y-%m-%d %H:%M:%S') if commit.commit and commit.commit.author and commit.commit.author.date else '',
                         'url': commit.html_url,
                         'files_changed': [f.filename for f in commit.files],
-                        'patch': patch_content
+                        'patch': patch_content or ''
                     })
                 except Exception as e:
-                    logger.debug(f"获取commit {sha}失败: {str(e)}")
-                    
+                    logger.debug(f"获取commit {full_repo}@{sha} 失败: {str(e)}")
+
         except Exception as e:
-            logger.warning(f"获取Issue #{issue.number}的相关commit失败: {str(e)}")
+            logger.warning(f"获取Issue #{issue.number}的相关commit/PR失败: {str(e)}")
         
         return {
             'comments': comments,
